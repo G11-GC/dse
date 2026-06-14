@@ -78,295 +78,344 @@ pub fn get_midi_messages_flattened<'a>(smf: &'a Smf) -> Result<Cow<'a, [TrackEve
 pub fn copy_midi_messages<'a, MapProgram>(midi_messages: Cow<'a, [TrackEvent<'a>]>, trks: &mut [TrkChunkWriter], mut map_program: MapProgram) -> Result<u128, DSEError>
 where
     MapProgram: FnMut(u8, u8, u8, bool, &mut TrkChunkWriter, Rc<RefCell<DSEEvent>>) -> Option<u8> {
-    // Loop through all the events
-    let mut global_tick = 0;
-    for midi_msg in midi_messages.as_ref() {
-        let delta = midi_msg.delta.as_int() as u128;
-        global_tick += delta;
+    // Pre-compute absolute ticks for every event
+    let mut events_with_ticks: Vec<(u128, &TrackEvent)> = Vec::new();
+    {
+        let mut global_tick = 0u128;
+        for midi_msg in midi_messages.as_ref() {
+            global_tick += midi_msg.delta.as_int() as u128;
+            events_with_ticks.push((global_tick, midi_msg));
+        }
+    }
 
-        match midi_msg.kind {
-            midly::TrackEventKind::Midi { channel, message } => {
-                let channel_i = channel.as_int() as usize + 1;
+    // Helper macro to process a single event (borrowck workaround for trks + map_program)
+    // We use a closure-like inline block inside the loop instead.
 
-                match message {
-                    midly::MidiMessage::NoteOn { key, vel } => {
-                        trks[channel_i].fix_current_global_tick(global_tick)?;
-                        if vel == 0 {
-                            trks[channel_i].note_off(key.as_int())?
-                        } else {
-                            trks[channel_i].note_on(key.as_int(), vel.as_int())?
-                        }
-                    },
-                    midly::MidiMessage::NoteOff { key, vel: _ } => {
-                        trks[channel_i].fix_current_global_tick(global_tick)?;
-                        trks[channel_i].note_off(key.as_int())?
-                    },
-                    midly::MidiMessage::Aftertouch { key, vel } => { /* Ignore aftertouch events */ },
-                    midly::MidiMessage::Controller { controller, value } => {
-                        trks[channel_i].fix_current_global_tick(global_tick)?;
-                        match controller.as_int() {
-                            00 => { // CC00 Bank Select MSB
-                                println!("{}", "Processing bank select message.".green());
-                                trks[channel_i].bank_select(value.as_int(), false, &mut map_program)?;
-                            },
-                            07 => { // CC07 Volume MSB
-                                trks[channel_i].add_other_with_params_u8("SetTrackVolume", value.as_int())?;
-                            },
-                            10 => { // CC10 Pan Position MSB
-                                trks[channel_i].add_other_with_params_u8("SetTrackPan", value.as_int())?;
-                            },
-                            11 => { // CC11 Expression MSB
-                                trks[channel_i].add_other_with_params_u8("SetTrackExpression", value.as_int())?;
-                            },
-                            _ => { /* Ignore the other controllers for now */ }
-                        }
-                    },
-                    midly::MidiMessage::ProgramChange { program } => {
-                        trks[channel_i].fix_current_global_tick(global_tick)?;
-                        println!("{}", "Processing program change message.".green());
-                        trks[channel_i].program_change(program.as_int(), false, &mut map_program)?;
-                    },
-                    midly::MidiMessage::ChannelAftertouch { vel } => { /* Ignore channel aftertouch events */ },
-                    midly::MidiMessage::PitchBend { bend } => {
-                        trks[channel_i].fix_current_global_tick(global_tick)?;
-                        trks[channel_i].add_other_with_params_i16::<BigEndian>("PitchBend", bend.as_int())?;
-                    },
-                }
-            },
-            midly::TrackEventKind::SysEx(_) => { /* Ignore sysex events */ },
-            midly::TrackEventKind::Escape(_) => { /* Ignore escape events */ },
-            midly::TrackEventKind::Meta(meta) => {
-                match meta {
-                    midly::MetaMessage::TrackNumber(_) => { /* Ignore */ },
-                    midly::MetaMessage::Text(_) => { /* Ignore */ },
-                    midly::MetaMessage::Copyright(_) => { /* Ignore */ },
-                    midly::MetaMessage::TrackName(_) => { /* Ignore */ },
-                    midly::MetaMessage::InstrumentName(_) => { /* Ignore */ },
-                    midly::MetaMessage::Lyric(_) => { /* Ignore */ },
-                    midly::MetaMessage::Marker(marker) => {
-                        if let Ok(marker) = String::from_utf8(marker.into()) {
-                            if marker.trim().to_lowercase() == "loopstart" {
-                                for trk in trks.iter_mut() {
-                                    trk.fix_current_global_tick(global_tick)?;
-                                    trk.add_other_no_params("LoopPoint")?;
+    let mut global_tick = 0u128;
+    let mut i = 0;
+    let mut should_break = false;
+
+    while i < events_with_ticks.len() && !should_break {
+        let current_tick = events_with_ticks[i].0;
+
+        // Find the end of this tick's group
+        let mut j = i;
+        while j < events_with_ticks.len() && events_with_ticks[j].0 == current_tick {
+            j += 1;
+        }
+        let tick_group = &events_with_ticks[i..j];
+        global_tick = current_tick;
+
+        // Two passes per tick:
+        //   pass 0 -> NoteOff and NoteOn-as-NoteOff (vel == 0)   [releases]
+        //   pass 1 -> everything else                              [attacks + other events]
+        for pass in 0u8..2 {
+            for &(_, midi_msg) in tick_group {
+                match midi_msg.kind {
+                    midly::TrackEventKind::Midi { channel, message } => {
+                        let channel_i = channel.as_int() as usize + 1;
+
+                        match message {
+                            midly::MidiMessage::NoteOn { key, vel } => {
+                                let is_release = vel == 0;
+                                if pass == 0 && is_release {
+                                    trks[channel_i].fix_current_global_tick(global_tick)?;
+                                    trks[channel_i].note_off(key.as_int())?;
+                                } else if pass == 1 && !is_release {
+                                    trks[channel_i].fix_current_global_tick(global_tick)?;
+                                    trks[channel_i].note_on(key.as_int(), vel.as_int())?;
                                 }
-                            } else if marker.trim().to_lowercase() == "loopend" {
-                                for trk in trks.iter_mut() {
-                                    trk.fix_current_global_tick(global_tick)?;
-                                    for val in 0..u8::MAX { // Reset synth
-                                        trk.note_off(val)?;
+                            },
+                            midly::MidiMessage::NoteOff { key, vel: _ } => {
+                                if pass == 0 {
+                                    trks[channel_i].fix_current_global_tick(global_tick)?;
+                                    trks[channel_i].note_off(key.as_int())?;
+                                }
+                            },
+                            midly::MidiMessage::Aftertouch { key: _, vel: _ } => { /* Ignore aftertouch events */ },
+                            midly::MidiMessage::Controller { controller, value } => {
+                                if pass == 1 {
+                                    trks[channel_i].fix_current_global_tick(global_tick)?;
+                                    match controller.as_int() {
+                                        00 => { // CC00 Bank Select MSB
+                                            println!("{}", "Processing bank select message.".green());
+                                            trks[channel_i].bank_select(value.as_int(), false, &mut map_program)?;
+                                        },
+                                        07 => { // CC07 Volume MSB
+                                            trks[channel_i].add_other_with_params_u8("SetTrackVolume", value.as_int())?;
+                                        },
+                                        10 => { // CC10 Pan Position MSB
+                                            trks[channel_i].add_other_with_params_u8("SetTrackPan", value.as_int())?;
+                                        },
+                                        11 => { // CC11 Expression MSB
+                                            trks[channel_i].add_other_with_params_u8("SetTrackExpression", value.as_int())?;
+                                        },
+                                        _ => { /* Ignore the other controllers for now */ }
                                     }
                                 }
-                                break;
-                            } else if marker.trim().to_lowercase() == "loopendnoreset" {
-                                break;
-                            } else if marker.trim().to_lowercase().starts_with("signal") {
-                                let cmd = marker.trim().to_lowercase();
-                                let signal_val: u8 = cmd[6..].replace("(", "").replace(")", "").trim().parse::<u8>().map_err(|_| DSEError::Invalid("MIDI Marker 'Signal(n)' must have a uint8 as its parameter!".to_string()))?;
-                                trks[0].fix_current_global_tick(global_tick)?;
-                                trks[0].add_other_with_params_u8("Signal", signal_val)?;
-                            } else if marker.trim().starts_with("dsec") {
-                                let mut track_i = 0;
-                                for cmd in marker.trim()[4..].trim_start().split(";") {
-                                    let cmd = cmd.trim();
-
-                                    println!("{}", cmd.green());
-
-                                    if cmd.starts_with("trk") {
-                                        let new_track_n = cmd[3..].trim_start().parse::<usize>()
-                                            .map_err(|_| DSEError::InvalidDSECommandFailedToParseTrkChange(cmd.to_string()))?;
-                                        track_i = new_track_n;
-                                        continue;
-                                    } else if cmd.starts_with("evttrk") {
-                                        track_i = 0;
-                                        continue;
-                                    }
-
-                                    let name;
-                                    let mut arguments_bytes: Vec<u8> = Vec::new();
-
-                                    if let Some(left_paren_index) = cmd.chars().position(|c| c == '(') {
-                                        name = cmd[..left_paren_index].trim_end();
-
-                                        // Parse arguments
-                                        let mut arguments_str = cmd[(left_paren_index+1)..].trim_start();
-                                        if arguments_str.len() == 0 {
-                                            return Err(DSEError::InvalidDSECommand(cmd.to_string(), "Opening parentheses must be closed!!".to_string()));
-                                        } else {
-                                            if arguments_str.chars().last().unwrap() == ')' {
-                                                arguments_str = arguments_str[..(arguments_str.len()-1)].trim_end();
-                                            } else {
-                                                return Err(DSEError::InvalidDSECommand(cmd.to_string(), "Opening parentheses must be closed!!".to_string()));
+                            },
+                            midly::MidiMessage::ProgramChange { program } => {
+                                if pass == 1 {
+                                    trks[channel_i].fix_current_global_tick(global_tick)?;
+                                    println!("{}", "Processing program change message.".green());
+                                    trks[channel_i].program_change(program.as_int(), false, &mut map_program)?;
+                                }
+                            },
+                            midly::MidiMessage::ChannelAftertouch { vel: _ } => { /* Ignore channel aftertouch events */ },
+                            midly::MidiMessage::PitchBend { bend } => {
+                                if pass == 1 {
+                                    trks[channel_i].fix_current_global_tick(global_tick)?;
+                                    trks[channel_i].add_other_with_params_i16::<BigEndian>("PitchBend", bend.as_int())?;
+                                }
+                            },
+                        }
+                    },
+                    midly::TrackEventKind::SysEx(_) => { /* Ignore sysex events */ },
+                    midly::TrackEventKind::Escape(_) => { /* Ignore escape events */ },
+                    midly::TrackEventKind::Meta(meta) => {
+                        if pass == 1 {
+                            match meta {
+                                midly::MetaMessage::TrackNumber(_) => { /* Ignore */ },
+                                midly::MetaMessage::Text(_) => { /* Ignore */ },
+                                midly::MetaMessage::Copyright(_) => { /* Ignore */ },
+                                midly::MetaMessage::TrackName(_) => { /* Ignore */ },
+                                midly::MetaMessage::InstrumentName(_) => { /* Ignore */ },
+                                midly::MetaMessage::Lyric(_) => { /* Ignore */ },
+                                midly::MetaMessage::Marker(marker) => {
+                                    if let Ok(marker) = String::from_utf8(marker.into()) {
+                                        if marker.trim().to_lowercase() == "loopstart" {
+                                            for trk in trks.iter_mut() {
+                                                trk.fix_current_global_tick(global_tick)?;
+                                                trk.add_other_no_params("LoopPoint")?;
                                             }
-                                        }
-                                        for arg in arguments_str.split(",").map(|x| x.trim().to_lowercase()) {
-                                            let mut added_argument_bytes: Vec<u8> = Vec::new();
-
-                                            let typed: Vec<&str> = arg.split("_").map(|x| x.trim()).collect();
-
-                                            if arg == "" {
-                                                // Skip
+                                        } else if marker.trim().to_lowercase() == "loopend" {
+                                            for trk in trks.iter_mut() {
+                                                trk.fix_current_global_tick(global_tick)?;
+                                                for val in 0..u8::MAX { // Reset synth
+                                                    trk.note_off(val)?;
+                                                }
                                             }
+                                            should_break = true;
+                                            break;
+                                        } else if marker.trim().to_lowercase() == "loopendnoreset" {
+                                            should_break = true;
+                                            break;
+                                        } else if marker.trim().to_lowercase().starts_with("signal") {
+                                            let cmd = marker.trim().to_lowercase();
+                                            let signal_val: u8 = cmd[6..].replace("(", "").replace(")", "").trim().parse::<u8>().map_err(|_| DSEError::Invalid("MIDI Marker 'Signal(n)' must have a uint8 as its parameter!".to_string()))?;
+                                            trks[0].fix_current_global_tick(global_tick)?;
+                                            trks[0].add_other_with_params_u8("Signal", signal_val)?;
+                                        } else if marker.trim().starts_with("dsec") {
+                                            let mut track_i = 0;
+                                            for cmd in marker.trim()[4..].trim_start().split(";") {
+                                                let cmd = cmd.trim();
 
-                                            else if typed.len() == 2 {
-                                                // Typed
-                                                match typed[1] {
-                                                    "i8" => added_argument_bytes.write_i8(
-                                                        typed[0].parse::<i8>()
-                                                            .map_or_else(|_| i8::from_str_radix(&typed[0].trim_start_matches("0x"), 16), |x| Ok(x))
-                                                            .map_err(|_| DSEError::InvalidDSECommandTypedArgument(cmd.to_string(), arg.to_string(), typed[1].to_string()))?
-                                                    ),
-                                                    "u8" => added_argument_bytes.write_u8(
-                                                        typed[0].parse::<u8>()
-                                                            .map_or_else(|_| u8::from_str_radix(&typed[0].trim_start_matches("0x"), 16), |x| Ok(x))
-                                                            .map_err(|_| DSEError::InvalidDSECommandTypedArgument(cmd.to_string(), arg.to_string(), typed[1].to_string()))?
-                                                    ),
+                                                println!("{}", cmd.green());
 
-                                                    "i16le" => added_argument_bytes.write_i16::<LittleEndian>(
-                                                        typed[0].parse::<i16>()
-                                                            .map_or_else(|_| i16::from_str_radix(&typed[0].trim_start_matches("0x"), 16), |x| Ok(x))
-                                                            .map_err(|_| DSEError::InvalidDSECommandTypedArgument(cmd.to_string(), arg.to_string(), typed[1].to_string()))?
-                                                    ),
-                                                    "u16le" => added_argument_bytes.write_u16::<LittleEndian>(
-                                                        typed[0].parse::<u16>()
-                                                            .map_or_else(|_| u16::from_str_radix(&typed[0].trim_start_matches("0x"), 16), |x| Ok(x))
-                                                            .map_err(|_| DSEError::InvalidDSECommandTypedArgument(cmd.to_string(), arg.to_string(), typed[1].to_string()))?
-                                                    ),
-                                                    "i32le" => added_argument_bytes.write_i32::<LittleEndian>(
-                                                        typed[0].parse::<i32>()
-                                                            .map_or_else(|_| i32::from_str_radix(&typed[0].trim_start_matches("0x"), 16), |x| Ok(x))
-                                                            .map_err(|_| DSEError::InvalidDSECommandTypedArgument(cmd.to_string(), arg.to_string(), typed[1].to_string()))?
-                                                    ),
-                                                    "u32le" => added_argument_bytes.write_u32::<LittleEndian>(
-                                                        typed[0].parse::<u32>()
-                                                            .map_or_else(|_| u32::from_str_radix(&typed[0].trim_start_matches("0x"), 16), |x| Ok(x))
-                                                            .map_err(|_| DSEError::InvalidDSECommandTypedArgument(cmd.to_string(), arg.to_string(), typed[1].to_string()))?
-                                                    ),
-                                                    "i64le" => added_argument_bytes.write_i64::<LittleEndian>(
-                                                        typed[0].parse::<i64>()
-                                                            .map_or_else(|_| i64::from_str_radix(&typed[0].trim_start_matches("0x"), 16), |x| Ok(x))
-                                                            .map_err(|_| DSEError::InvalidDSECommandTypedArgument(cmd.to_string(), arg.to_string(), typed[1].to_string()))?
-                                                    ),
-                                                    "u64le" => added_argument_bytes.write_u64::<LittleEndian>(
-                                                        typed[0].parse::<u64>()
-                                                            .map_or_else(|_| u64::from_str_radix(&typed[0].trim_start_matches("0x"), 16), |x| Ok(x))
-                                                            .map_err(|_| DSEError::InvalidDSECommandTypedArgument(cmd.to_string(), arg.to_string(), typed[1].to_string()))?
-                                                    ),
-                                                    "i128le" => added_argument_bytes.write_i128::<LittleEndian>(
-                                                        typed[0].parse::<i128>()
-                                                            .map_or_else(|_| i128::from_str_radix(&typed[0].trim_start_matches("0x"), 16), |x| Ok(x))
-                                                            .map_err(|_| DSEError::InvalidDSECommandTypedArgument(cmd.to_string(), arg.to_string(), typed[1].to_string()))?
-                                                    ),
-                                                    "u128le" => added_argument_bytes.write_u128::<LittleEndian>(
-                                                        typed[0].parse::<u128>()
-                                                            .map_or_else(|_| u128::from_str_radix(&typed[0].trim_start_matches("0x"), 16), |x| Ok(x))
-                                                            .map_err(|_| DSEError::InvalidDSECommandTypedArgument(cmd.to_string(), arg.to_string(), typed[1].to_string()))?
-                                                    ),
+                                                if cmd.starts_with("trk") {
+                                                    let new_track_n = cmd[3..].trim_start().parse::<usize>()
+                                                        .map_err(|_| DSEError::InvalidDSECommandFailedToParseTrkChange(cmd.to_string()))?;
+                                                    track_i = new_track_n;
+                                                    continue;
+                                                } else if cmd.starts_with("evttrk") {
+                                                    track_i = 0;
+                                                    continue;
+                                                }
 
-                                                    "i16be" => added_argument_bytes.write_i16::<BigEndian>(
-                                                        typed[0].parse::<i16>()
-                                                            .map_or_else(|_| i16::from_str_radix(&typed[0].trim_start_matches("0x"), 16), |x| Ok(x))
-                                                            .map_err(|_| DSEError::InvalidDSECommandTypedArgument(cmd.to_string(), arg.to_string(), typed[1].to_string()))?
-                                                    ),
-                                                    "u16be" => added_argument_bytes.write_u16::<BigEndian>(
-                                                        typed[0].parse::<u16>()
-                                                            .map_or_else(|_| u16::from_str_radix(&typed[0].trim_start_matches("0x"), 16), |x| Ok(x))
-                                                            .map_err(|_| DSEError::InvalidDSECommandTypedArgument(cmd.to_string(), arg.to_string(), typed[1].to_string()))?
-                                                    ),
-                                                    "i32be" => added_argument_bytes.write_i32::<BigEndian>(
-                                                        typed[0].parse::<i32>()
-                                                            .map_or_else(|_| i32::from_str_radix(&typed[0].trim_start_matches("0x"), 16), |x| Ok(x))
-                                                            .map_err(|_| DSEError::InvalidDSECommandTypedArgument(cmd.to_string(), arg.to_string(), typed[1].to_string()))?
-                                                    ),
-                                                    "u32be" => added_argument_bytes.write_u32::<BigEndian>(
-                                                        typed[0].parse::<u32>()
-                                                            .map_or_else(|_| u32::from_str_radix(&typed[0].trim_start_matches("0x"), 16), |x| Ok(x))
-                                                            .map_err(|_| DSEError::InvalidDSECommandTypedArgument(cmd.to_string(), arg.to_string(), typed[1].to_string()))?
-                                                    ),
-                                                    "i64be" => added_argument_bytes.write_i64::<BigEndian>(
-                                                        typed[0].parse::<i64>()
-                                                            .map_or_else(|_| i64::from_str_radix(&typed[0].trim_start_matches("0x"), 16), |x| Ok(x))
-                                                            .map_err(|_| DSEError::InvalidDSECommandTypedArgument(cmd.to_string(), arg.to_string(), typed[1].to_string()))?
-                                                    ),
-                                                    "u64be" => added_argument_bytes.write_u64::<BigEndian>(
-                                                        typed[0].parse::<u64>()
-                                                            .map_or_else(|_| u64::from_str_radix(&typed[0].trim_start_matches("0x"), 16), |x| Ok(x))
-                                                            .map_err(|_| DSEError::InvalidDSECommandTypedArgument(cmd.to_string(), arg.to_string(), typed[1].to_string()))?
-                                                    ),
-                                                    "i128be" => added_argument_bytes.write_i128::<BigEndian>(
-                                                        typed[0].parse::<i128>()
-                                                            .map_or_else(|_| i128::from_str_radix(&typed[0].trim_start_matches("0x"), 16), |x| Ok(x))
-                                                            .map_err(|_| DSEError::InvalidDSECommandTypedArgument(cmd.to_string(), arg.to_string(), typed[1].to_string()))?
-                                                    ),
-                                                    "u128be" => added_argument_bytes.write_u128::<BigEndian>(
-                                                        typed[0].parse::<u128>()
-                                                            .map_or_else(|_| u128::from_str_radix(&typed[0].trim_start_matches("0x"), 16), |x| Ok(x))
-                                                            .map_err(|_| DSEError::InvalidDSECommandTypedArgument(cmd.to_string(), arg.to_string(), typed[1].to_string()))?
-                                                    ),
+                                                let name;
+                                                let mut arguments_bytes: Vec<u8> = Vec::new();
 
-                                                    _ => {
-                                                        return Err(DSEError::InvalidDSECommandTypedArgument(cmd.to_string(), arg.to_string(), typed[1].to_string()))
+                                                if let Some(left_paren_index) = cmd.chars().position(|c| c == '(') {
+                                                    name = cmd[..left_paren_index].trim_end();
+
+                                                    // Parse arguments
+                                                    let mut arguments_str = cmd[(left_paren_index+1)..].trim_start();
+                                                    if arguments_str.len() == 0 {
+                                                        return Err(DSEError::InvalidDSECommand(cmd.to_string(), "Opening parentheses must be closed!!".to_string()));
+                                                    } else {
+                                                        if arguments_str.chars().last().unwrap() == ')' {
+                                                            arguments_str = arguments_str[..(arguments_str.len()-1)].trim_end();
+                                                        } else {
+                                                            return Err(DSEError::InvalidDSECommand(cmd.to_string(), "Opening parentheses must be closed!!".to_string()));
+                                                        }
                                                     }
-                                                }?;
-                                            }
-                                            
-                                            else if let Ok(val) = arg.parse::<i8>() {
-                                                added_argument_bytes.write_i8(val)?;
-                                            } else if let Ok(val) = i8::from_str_radix(&arg.trim_start_matches("0x"), 16) {
-                                                added_argument_bytes.write_i8(val)?;
-                                            }
-                                            
-                                            else if let Ok(val) = arg.parse::<u8>() {
-                                                added_argument_bytes.write_u8(val)?;
-                                            } else if let Ok(val) = u8::from_str_radix(&arg.trim_start_matches("0x"), 16) {
-                                                added_argument_bytes.write_u8(val)?;
-                                            }
+                                                    for arg in arguments_str.split(",").map(|x| x.trim().to_lowercase()) {
+                                                        let mut added_argument_bytes: Vec<u8> = Vec::new();
 
-                                            else {
-                                                return Err(DSEError::InvalidDSECommand(cmd.to_string(), format!("Value '{}' could not be parsed!", arg)));
-                                            }
+                                                        let typed: Vec<&str> = arg.split("_").map(|x| x.trim()).collect();
 
-                                            arguments_bytes.extend(added_argument_bytes);
+                                                        if arg == "" {
+                                                            // Skip
+                                                        }
+
+                                                        else if typed.len() == 2 {
+                                                            // Typed
+                                                            match typed[1] {
+                                                                "i8" => added_argument_bytes.write_i8(
+                                                                    typed[0].parse::<i8>()
+                                                                        .map_or_else(|_| i8::from_str_radix(&typed[0].trim_start_matches("0x"), 16), |x| Ok(x))
+                                                                        .map_err(|_| DSEError::InvalidDSECommandTypedArgument(cmd.to_string(), arg.to_string(), typed[1].to_string()))?
+                                                                ),
+                                                                "u8" => added_argument_bytes.write_u8(
+                                                                    typed[0].parse::<u8>()
+                                                                        .map_or_else(|_| u8::from_str_radix(&typed[0].trim_start_matches("0x"), 16), |x| Ok(x))
+                                                                        .map_err(|_| DSEError::InvalidDSECommandTypedArgument(cmd.to_string(), arg.to_string(), typed[1].to_string()))?
+                                                                ),
+
+                                                                "i16le" => added_argument_bytes.write_i16::<LittleEndian>(
+                                                                    typed[0].parse::<i16>()
+                                                                        .map_or_else(|_| i16::from_str_radix(&typed[0].trim_start_matches("0x"), 16), |x| Ok(x))
+                                                                        .map_err(|_| DSEError::InvalidDSECommandTypedArgument(cmd.to_string(), arg.to_string(), typed[1].to_string()))?
+                                                                ),
+                                                                "u16le" => added_argument_bytes.write_u16::<LittleEndian>(
+                                                                    typed[0].parse::<u16>()
+                                                                        .map_or_else(|_| u16::from_str_radix(&typed[0].trim_start_matches("0x"), 16), |x| Ok(x))
+                                                                        .map_err(|_| DSEError::InvalidDSECommandTypedArgument(cmd.to_string(), arg.to_string(), typed[1].to_string()))?
+                                                                ),
+                                                                "i32le" => added_argument_bytes.write_i32::<LittleEndian>(
+                                                                    typed[0].parse::<i32>()
+                                                                        .map_or_else(|_| i32::from_str_radix(&typed[0].trim_start_matches("0x"), 16), |x| Ok(x))
+                                                                        .map_err(|_| DSEError::InvalidDSECommandTypedArgument(cmd.to_string(), arg.to_string(), typed[1].to_string()))?
+                                                                ),
+                                                                "u32le" => added_argument_bytes.write_u32::<LittleEndian>(
+                                                                    typed[0].parse::<u32>()
+                                                                        .map_or_else(|_| u32::from_str_radix(&typed[0].trim_start_matches("0x"), 16), |x| Ok(x))
+                                                                        .map_err(|_| DSEError::InvalidDSECommandTypedArgument(cmd.to_string(), arg.to_string(), typed[1].to_string()))?
+                                                                ),
+                                                                "i64le" => added_argument_bytes.write_i64::<LittleEndian>(
+                                                                    typed[0].parse::<i64>()
+                                                                        .map_or_else(|_| i64::from_str_radix(&typed[0].trim_start_matches("0x"), 16), |x| Ok(x))
+                                                                        .map_err(|_| DSEError::InvalidDSECommandTypedArgument(cmd.to_string(), arg.to_string(), typed[1].to_string()))?
+                                                                ),
+                                                                "u64le" => added_argument_bytes.write_u64::<LittleEndian>(
+                                                                    typed[0].parse::<u64>()
+                                                                        .map_or_else(|_| u64::from_str_radix(&typed[0].trim_start_matches("0x"), 16), |x| Ok(x))
+                                                                        .map_err(|_| DSEError::InvalidDSECommandTypedArgument(cmd.to_string(), arg.to_string(), typed[1].to_string()))?
+                                                                ),
+                                                                "i128le" => added_argument_bytes.write_i128::<LittleEndian>(
+                                                                    typed[0].parse::<i128>()
+                                                                        .map_or_else(|_| i128::from_str_radix(&typed[0].trim_start_matches("0x"), 16), |x| Ok(x))
+                                                                        .map_err(|_| DSEError::InvalidDSECommandTypedArgument(cmd.to_string(), arg.to_string(), typed[1].to_string()))?
+                                                                ),
+                                                                "u128le" => added_argument_bytes.write_u128::<LittleEndian>(
+                                                                    typed[0].parse::<u128>()
+                                                                        .map_or_else(|_| u128::from_str_radix(&typed[0].trim_start_matches("0x"), 16), |x| Ok(x))
+                                                                        .map_err(|_| DSEError::InvalidDSECommandTypedArgument(cmd.to_string(), arg.to_string(), typed[1].to_string()))?
+                                                                ),
+
+                                                                "i16be" => added_argument_bytes.write_i16::<BigEndian>(
+                                                                    typed[0].parse::<i16>()
+                                                                        .map_or_else(|_| i16::from_str_radix(&typed[0].trim_start_matches("0x"), 16), |x| Ok(x))
+                                                                        .map_err(|_| DSEError::InvalidDSECommandTypedArgument(cmd.to_string(), arg.to_string(), typed[1].to_string()))?
+                                                                ),
+                                                                "u16be" => added_argument_bytes.write_u16::<BigEndian>(
+                                                                    typed[0].parse::<u16>()
+                                                                        .map_or_else(|_| u16::from_str_radix(&typed[0].trim_start_matches("0x"), 16), |x| Ok(x))
+                                                                        .map_err(|_| DSEError::InvalidDSECommandTypedArgument(cmd.to_string(), arg.to_string(), typed[1].to_string()))?
+                                                                ),
+                                                                "i32be" => added_argument_bytes.write_i32::<BigEndian>(
+                                                                    typed[0].parse::<i32>()
+                                                                        .map_or_else(|_| i32::from_str_radix(&typed[0].trim_start_matches("0x"), 16), |x| Ok(x))
+                                                                        .map_err(|_| DSEError::InvalidDSECommandTypedArgument(cmd.to_string(), arg.to_string(), typed[1].to_string()))?
+                                                                ),
+                                                                "u32be" => added_argument_bytes.write_u32::<BigEndian>(
+                                                                    typed[0].parse::<u32>()
+                                                                        .map_or_else(|_| u32::from_str_radix(&typed[0].trim_start_matches("0x"), 16), |x| Ok(x))
+                                                                        .map_err(|_| DSEError::InvalidDSECommandTypedArgument(cmd.to_string(), arg.to_string(), typed[1].to_string()))?
+                                                                ),
+                                                                "i64be" => added_argument_bytes.write_i64::<BigEndian>(
+                                                                    typed[0].parse::<i64>()
+                                                                        .map_or_else(|_| i64::from_str_radix(&typed[0].trim_start_matches("0x"), 16), |x| Ok(x))
+                                                                        .map_err(|_| DSEError::InvalidDSECommandTypedArgument(cmd.to_string(), arg.to_string(), typed[1].to_string()))?
+                                                                ),
+                                                                "u64be" => added_argument_bytes.write_u64::<BigEndian>(
+                                                                    typed[0].parse::<u64>()
+                                                                        .map_or_else(|_| u64::from_str_radix(&typed[0].trim_start_matches("0x"), 16), |x| Ok(x))
+                                                                        .map_err(|_| DSEError::InvalidDSECommandTypedArgument(cmd.to_string(), arg.to_string(), typed[1].to_string()))?
+                                                                ),
+                                                                "i128be" => added_argument_bytes.write_i128::<BigEndian>(
+                                                                    typed[0].parse::<i128>()
+                                                                        .map_or_else(|_| i128::from_str_radix(&typed[0].trim_start_matches("0x"), 16), |x| Ok(x))
+                                                                        .map_err(|_| DSEError::InvalidDSECommandTypedArgument(cmd.to_string(), arg.to_string(), typed[1].to_string()))?
+                                                                ),
+                                                                "u128be" => added_argument_bytes.write_u128::<BigEndian>(
+                                                                    typed[0].parse::<u128>()
+                                                                        .map_or_else(|_| u128::from_str_radix(&typed[0].trim_start_matches("0x"), 16), |x| Ok(x))
+                                                                        .map_err(|_| DSEError::InvalidDSECommandTypedArgument(cmd.to_string(), arg.to_string(), typed[1].to_string()))?
+                                                                ),
+
+                                                                _ => {
+                                                                    return Err(DSEError::InvalidDSECommandTypedArgument(cmd.to_string(), arg.to_string(), typed[1].to_string()))
+                                                                }
+                                                            }?;
+                                                        }
+                                                        
+                                                        else if let Ok(val) = arg.parse::<i8>() {
+                                                            added_argument_bytes.write_i8(val)?;
+                                                        } else if let Ok(val) = i8::from_str_radix(&arg.trim_start_matches("0x"), 16) {
+                                                            added_argument_bytes.write_i8(val)?;
+                                                        }
+                                                        
+                                                        else if let Ok(val) = arg.parse::<u8>() {
+                                                            added_argument_bytes.write_u8(val)?;
+                                                        } else if let Ok(val) = u8::from_str_radix(&arg.trim_start_matches("0x"), 16) {
+                                                            added_argument_bytes.write_u8(val)?;
+                                                        }
+
+                                                        else {
+                                                            return Err(DSEError::InvalidDSECommand(cmd.to_string(), format!("Value '{}' could not be parsed!", arg)));
+                                                        }
+
+                                                        arguments_bytes.extend(added_argument_bytes);
+                                                    }
+                                                } else {
+                                                    name = cmd;
+                                                }
+
+                                                let mut evt = Other::default();
+                                                evt.code = Other::name_to_code(name)?;
+
+                                                // Check if the appropriate number of arguments were passed
+                                                let (canonical_name, (_, _, num_bytes_taken)) = Other::lookup(evt.code)?;
+                                                if arguments_bytes.len() != *num_bytes_taken as usize {
+                                                    return Err(DSEError::InvalidDSECommandArguments(cmd.to_string(), arguments_bytes.len(), canonical_name.to_string(), *num_bytes_taken as usize))
+                                                }
+
+                                                (&mut evt.parameters[..]).write_all(&arguments_bytes)?;
+                                                trks[track_i].fix_current_global_tick(global_tick)?;
+                                                trks[track_i].add_other_event(evt);
+                                            }
                                         }
-                                    } else {
-                                        name = cmd;
                                     }
-
-                                    let mut evt = Other::default();
-                                    evt.code = Other::name_to_code(name)?;
-
-                                    // Check if the appropriate number of arguments were passed
-                                    let (canonical_name, (_, _, num_bytes_taken)) = Other::lookup(evt.code)?;
-                                    if arguments_bytes.len() != *num_bytes_taken as usize {
-                                        return Err(DSEError::InvalidDSECommandArguments(cmd.to_string(), arguments_bytes.len(), canonical_name.to_string(), *num_bytes_taken as usize))
-                                    }
-
-                                    (&mut evt.parameters[..]).write_all(&arguments_bytes)?;
-                                    trks[track_i].fix_current_global_tick(global_tick)?;
-                                    trks[track_i].add_other_event(evt);
-                                }
+                                },
+                                midly::MetaMessage::CuePoint(_) => { /* Ignore */ },
+                                midly::MetaMessage::ProgramName(_) => { /* Ignore */ },
+                                midly::MetaMessage::DeviceName(_) => { /* Ignore */ },
+                                midly::MetaMessage::MidiChannel(_) => { /* Ignore */ },
+                                midly::MetaMessage::MidiPort(_) => { /* Ignore */ },
+                                midly::MetaMessage::EndOfTrack => { /* Ignore */ },
+                                midly::MetaMessage::Tempo(microspb) => {
+                                    trks[0].fix_current_global_tick(global_tick)?;
+                                    trks[0].add_other_with_params_u8("SetTempo", (6e7 / microspb.as_int() as f64).round() as u8)?;
+                                },
+                                midly::MetaMessage::SmpteOffset(_) => { /* Ignore */ },
+                                midly::MetaMessage::TimeSignature(_, _, _, _) => { /* Ignore */ },
+                                midly::MetaMessage::KeySignature(_, _) => { /* Ignore */ },
+                                midly::MetaMessage::SequencerSpecific(_) => { /* Ignore */ },
+                                midly::MetaMessage::Unknown(_, _) => { /* Ignore */ },
                             }
                         }
                     },
-                    midly::MetaMessage::CuePoint(_) => { /* Ignore */ },
-                    midly::MetaMessage::ProgramName(_) => { /* Ignore */ },
-                    midly::MetaMessage::DeviceName(_) => { /* Ignore */ },
-                    midly::MetaMessage::MidiChannel(_) => { /* Ignore */ },
-                    midly::MetaMessage::MidiPort(_) => { /* Ignore */ },
-                    midly::MetaMessage::EndOfTrack => { /* Ignore */ },
-                    midly::MetaMessage::Tempo(microspb) => {
-                        trks[0].fix_current_global_tick(global_tick)?;
-                        trks[0].add_other_with_params_u8("SetTempo", (6e7 / microspb.as_int() as f64).round() as u8)?;
-                    },
-                    midly::MetaMessage::SmpteOffset(_) => { /* Ignore */ },
-                    midly::MetaMessage::TimeSignature(_, _, _, _) => { /* Ignore */ },
-                    midly::MetaMessage::KeySignature(_, _) => { /* Ignore */ },
-                    midly::MetaMessage::SequencerSpecific(_) => { /* Ignore */ },
-                    midly::MetaMessage::Unknown(_, _) => { /* Ignore */ },
                 }
-            },
+
+                if should_break { break; }
+            }
+            if should_break { break; }
         }
+
+        i = j;
     }
+
     for trk in trks {
         trk.fix_current_global_tick(global_tick)?;
     }
